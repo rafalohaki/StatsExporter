@@ -26,7 +26,7 @@ import:
   playersPerTick: 2
   # How many ticks to wait between processing each player file in bulk mode.
   # Adds extra throttling. 0 = no extra delay, 1 = tiny delay.
-  delayBetweenPlayersTicks: 0
+  delayBetweenPlayersTicks: 1
 
 # Settings for automatic synchronization based on events and timers
 sync:
