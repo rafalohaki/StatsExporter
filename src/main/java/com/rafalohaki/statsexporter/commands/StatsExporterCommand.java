@@ -183,10 +183,10 @@ public class StatsExporterCommand implements CommandExecutor {
         sender.sendMessage(prefix.append(Component.text("Reloading configuration...")));
         plugin.reloadConfig();
         // Update internal plugin state if needed based on new config values.
-        // Note: Critical changes like API URL/Key might still require a full plugin restart/reload
+        // Note: Critical changes like API URL/Key/Retry settings might still require a full plugin restart/reload
         // for components like OkHttpClient to reliably pick them up.
         sender.sendMessage(prefix.append(Component.text("Configuration reloaded.", NamedTextColor.GREEN)));
-        sender.sendMessage(prefix.append(Component.text("Note: API URL/Key changes usually require a plugin restart (/plugman reload StatsExporter or server restart).", NamedTextColor.YELLOW)));
+        sender.sendMessage(prefix.append(Component.text("Note: API URL/Key/Retry changes usually require a plugin restart (/plugman reload StatsExporter or server restart).", NamedTextColor.YELLOW)));
         plugin.log(Level.INFO, "Configuration reloaded via command by " + sender.getName());
     }
 
@@ -207,6 +207,15 @@ public class StatsExporterCommand implements CommandExecutor {
          sender.sendMessage(Component.text(" Periodic Sync: ", NamedTextColor.YELLOW)
              .append(Component.text(periodicEnabled, NamedTextColor.WHITE))
              .append(periodicEnabled ? Component.text(" (" + periodicInterval + " min interval)", NamedTextColor.GRAY) : Component.empty()));
+
+         // --- Added Retry Info ---
+         int maxRetries = plugin.getPluginConfig().getInt("api.maxRetries", 3);
+         long retryDelay = plugin.getPluginConfig().getLong("api.retryDelaySeconds", 10);
+         boolean retriesEnabled = maxRetries > 0;
+         sender.sendMessage(Component.text(" API Retries: ", NamedTextColor.YELLOW)
+             .append(Component.text(retriesEnabled, NamedTextColor.WHITE))
+             .append(retriesEnabled ? Component.text(" (Max: " + maxRetries + ", Delay: " + retryDelay + "s)", NamedTextColor.GRAY) : Component.empty()));
+         // --- End Retry Info ---
 
          boolean importRunning = plugin.isBulkImportRunning();
          sender.sendMessage(Component.text(" Bulk Import Active: ", NamedTextColor.YELLOW)

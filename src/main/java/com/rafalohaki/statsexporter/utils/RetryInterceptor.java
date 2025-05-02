@@ -42,15 +42,26 @@ public class RetryInterceptor implements Interceptor {
 
         while (tryCount <= maxRetries) {
             if (tryCount > 0) {
+                // --- Retry Delay Implementation ---
                 // Calculate delay (simple exponential backoff)
                 long delay = (long) (retryDelayMillis * Math.pow(2, tryCount - 1));
                 plugin.debug("Retry attempt #" + tryCount + " for request to " + request.url() + ". Waiting " + delay + "ms...");
+
+                // Use Thread.sleep for the delay.
+                // NOTE: This blocks the current OkHttp Dispatcher thread during the sleep period.
+                // OkHttp uses a pool of threads, so other requests can proceed concurrently.
+                // However, if many requests require long retries simultaneously, it could
+                // temporarily exhaust the dispatcher pool. For typical stats exporting,
+                // this simple approach is usually acceptable and significantly less complex
+                // than fully asynchronous delay handling within the interceptor chain.
                 try {
                     Thread.sleep(delay);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    plugin.log(Level.WARNING, "Retry delay interrupted for request to " + request.url(), e);
                     throw new IOException("Retry interrupted", e);
                 }
+                // --- End Retry Delay ---
             }
 
             // Close previous response body before retrying to avoid resource leaks
@@ -59,6 +70,7 @@ public class RetryInterceptor implements Interceptor {
             }
 
             try {
+                // Proceed with the request (or retry)
                 response = chain.proceed(request);
 
                 // If successful, return the response immediately
@@ -79,22 +91,22 @@ public class RetryInterceptor implements Interceptor {
                 }
 
             } catch (IOException e) {
+                 // IOException (e.g., connection timeout, reset) is generally retryable
                  plugin.log(Level.WARNING, "Request to " + request.url() + " failed with IOException: " + e.getMessage() + ". Attempt " + tryCount + "/" + maxRetries);
                  exception = e; // Store the exception
                  tryCount++;
-                 // IOException is generally retryable
-                 continue;
+                 continue; // Continue to the next iteration for retry
             }
         }
 
-        // If loop finishes (max retries exceeded)
+        // If loop finishes because max retries were exceeded
         plugin.log(Level.SEVERE, "Request to " + request.url() + " failed after " + maxRetries + " retries.");
         if (exception != null) {
-            throw exception; // Throw the last encountered IOException
+            throw exception; // Throw the last encountered IOException if that was the last failure reason
         } else if (response != null) {
-            return response; // Return the last received response (which was unsuccessful)
+            return response; // Return the last received response (which was an unsuccessful, retryable code)
         } else {
-            // Should not happen, but fallback
+            // Should not happen in theory, but provides a fallback
             throw new IOException("Request failed after " + maxRetries + " retries with no response or exception recorded.");
         }
     }
