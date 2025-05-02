@@ -10,6 +10,10 @@ api:
   key: "YOUR_SECRET_API_KEY_HERE"
   # Timeout in seconds for HTTP requests
   timeoutSeconds: 10
+  # Maximum number of retries for failed HTTP requests (connection errors or 5xx server errors)
+  maxRetries: 3 # New
+  # Delay between retry attempts in seconds for failed batches
+  retryDelaySeconds: 10 # New
 
 # Settings for batching data before sending to the API
 batch:

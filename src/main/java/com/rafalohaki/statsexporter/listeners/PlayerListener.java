@@ -19,7 +19,6 @@ public class PlayerListener implements Listener {
     private final HttpUtils httpUtils;
     private final StatsFileReader statsFileReader;
     private final boolean syncOnQuit;
-    // Bukkit async executor
     private final Executor bukkitExecutor;
 
 
@@ -31,30 +30,28 @@ public class PlayerListener implements Listener {
         this.bukkitExecutor = runnable -> Bukkit.getScheduler().runTaskAsynchronously(plugin, runnable);
     }
 
-    // Listen on HIGH priority to try and catch stats just before player fully disconnects
-    // Though file saving might happen slightly after anyway.
     @EventHandler(priority = EventPriority.HIGH)
     public void onPlayerQuit(PlayerQuitEvent event) {
         if (!syncOnQuit) {
-            return; // Sync on quit is disabled in config
+            return;
         }
 
         Player player = event.getPlayer();
-        plugin.debug("Player " + player.getName() + " quit. Queueing stats sync.");
+        plugin.debug("Player " + player.getName() + " quit. Queueing stats sync."); // Use debug
 
-        // Asynchronously read stats and then queue them
         statsFileReader.getPlayerDataMapAsync(player)
-            .thenAcceptAsync(playerDataMap -> { // Process the result asynchronously
+            .thenAcceptAsync(playerDataMap -> {
                 if (playerDataMap != null && !playerDataMap.isEmpty()) {
-                    plugin.debug("Successfully read stats for quitting player " + player.getName() + ". Queueing for send.");
-                    httpUtils.queuePlayerData(playerDataMap);
+                    plugin.debug("Successfully read stats for quitting player " + player.getName() + ". Queueing for send."); // Use debug
+                    httpUtils.queuePlayerData(playerDataMap); // Internal logging is debug
                 } else {
-                    plugin.debug("Stats map was empty for quitting player " + player.getName() + ". Nothing to queue.");
+                    plugin.debug("Stats map was empty or null for quitting player " + player.getName() + ". Nothing to queue."); // Use debug
                 }
-            }, bukkitExecutor) // Ensure this callback also runs on Bukkit's async thread pool
-            .exceptionally(ex -> { // Handle potential errors during async processing
-                plugin.log(Level.WARNING, "Error processing stats for quitting player " + player.getName() + ": " + ex.getMessage(), ex);
-                return null; // Required for exceptionally stage
+            }, bukkitExecutor)
+            .exceptionally(ex -> {
+                // Keep WARNING for errors processing quit event
+                plugin.log(Level.WARNING, "Error processing stats for quitting player " + player.getName(), ex);
+                return null;
             });
     }
 }
