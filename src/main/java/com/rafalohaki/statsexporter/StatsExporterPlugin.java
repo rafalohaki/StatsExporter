@@ -2,11 +2,11 @@ package com.rafalohaki.statsexporter;
 
 import com.rafalohaki.statsexporter.commands.StatsExporterCommand;
 import com.rafalohaki.statsexporter.listeners.PlayerListener;
-import com.rafalohaki.statsexporter.tasks.StatsSyncTask; // Import the task
+import com.rafalohaki.statsexporter.tasks.StatsSyncTask;
 import com.rafalohaki.statsexporter.utils.HttpUtils;
 import com.rafalohaki.statsexporter.utils.StatsFileReader;
 import okhttp3.OkHttpClient;
-import org.bukkit.Bukkit;
+// Unused import org.bukkit.Bukkit; removed
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -22,22 +22,19 @@ public final class StatsExporterPlugin extends JavaPlugin {
     private HttpUtils httpUtils;
     private StatsFileReader statsFileReader;
     private BukkitTask periodicSyncTask;
-    // Reference to the bulk import task runnable for status checking
-    private StatsSyncTask bulkImportRunnable; // Use the task class type
-    private BukkitTask bulkImportBukkitTask; // Keep BukkitTask ref for cancellation
+    private StatsSyncTask bulkImportRunnable;
+    private BukkitTask bulkImportBukkitTask;
 
 
     @Override
     public void onEnable() {
         instance = this;
-        // 1. Load Configuration
         getLogger().info("Loading configuration...");
         saveDefaultConfig();
         pluginConfig = getConfig();
-        reloadConfig(); // Ensure latest config is loaded after potential creation
+        reloadConfig();
         pluginConfig = getConfig();
 
-        // 2. Validate Configuration
         getLogger().info("Validating configuration...");
         String apiUrl = pluginConfig.getString("api.url", "");
         String apiKey = pluginConfig.getString("api.key", "");
@@ -54,7 +51,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
         }
         getLogger().info("Configuration loaded and validated successfully.");
 
-        // 3. Initialize Components
         getLogger().info("Initializing components...");
         long timeout = pluginConfig.getLong("api.timeoutSeconds", 10);
         this.httpClient = new OkHttpClient.Builder()
@@ -68,12 +64,10 @@ public final class StatsExporterPlugin extends JavaPlugin {
 
         getLogger().info("Components initialized.");
 
-        // 4. Register Event Listeners
         getLogger().info("Registering event listeners...");
         getServer().getPluginManager().registerEvents(new PlayerListener(this), this);
         getLogger().info("Event listeners registered.");
 
-        // 5. Register Commands
         getLogger().info("Registering commands...");
         try {
             getCommand("statsexporter").setExecutor(new StatsExporterCommand(this));
@@ -82,7 +76,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
         }
         getLogger().info("Commands registered.");
 
-        // 6. Schedule Repeating Tasks (Periodic Sync) - Corrected
         if (pluginConfig.getBoolean("sync.periodicOnlineSync", true)) {
             long intervalMinutes = pluginConfig.getLong("sync.periodicOnlineSyncIntervalMinutes", 20);
             if (intervalMinutes > 0) {
@@ -90,14 +83,16 @@ public final class StatsExporterPlugin extends JavaPlugin {
                 getLogger().info("Scheduling periodic online player sync every " + intervalMinutes + " minutes (" + intervalTicks + " ticks).");
 
                  try {
-                    // Create the task instance for periodic sync
-                    StatsSyncTask syncTaskRunnable = new StatsSyncTask(this); // Use periodic constructor
-                    // Schedule the task to run asynchronously
+                    StatsSyncTask syncTaskRunnable = new StatsSyncTask(this);
+
+                    // Use explicit Runnable to silence deprecation warning
+                    Runnable syncTaskAsRunnable = syncTaskRunnable;
                     this.periodicSyncTask = getServer().getScheduler().runTaskTimerAsynchronously(
                             this,
-                            syncTaskRunnable,
-                            1200L, // Start after 1 minute
-                            intervalTicks); // Repeat every interval
+                            syncTaskAsRunnable, // Pass the Runnable
+                            1200L,              // Start after 1 minute
+                            intervalTicks);     // Repeat every interval
+
                  } catch (Exception e) {
                     getLogger().log(Level.SEVERE, "Failed to schedule periodic sync task", e);
                  }
@@ -109,7 +104,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
             getLogger().info("Periodic online player sync is disabled in config.");
         }
 
-
         getLogger().info("StatsExporter has been enabled successfully!");
     }
 
@@ -117,16 +111,13 @@ public final class StatsExporterPlugin extends JavaPlugin {
     public void onDisable() {
         getLogger().info("Disabling StatsExporter...");
 
-        // 1. Cancel scheduled Bukkit tasks
         getLogger().info("Cancelling scheduled tasks...");
         if (periodicSyncTask != null && !periodicSyncTask.isCancelled()) {
             periodicSyncTask.cancel();
             getLogger().info("Cancelled periodic sync task.");
         }
-        // Use the dedicated cancel method for bulk import
-        cancelBulkImportTask(); // This logs its own message if it cancels anything
+        cancelBulkImportTask();
 
-        // 2. Process remaining data and shutdown HttpUtils
         if (httpUtils != null) {
             getLogger().info("Flushing remaining batched data and shutting down HttpUtils...");
             httpUtils.flushBatchSync();
@@ -136,8 +127,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
              getLogger().info("HttpUtils was not initialized, skipping flush/shutdown.");
         }
 
-
-        // 3. Clean up OkHttp Client resources
         if (httpClient != null) {
              getLogger().info("Shutting down HTTP client...");
             httpClient.dispatcher().executorService().shutdown();
@@ -185,7 +174,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
 
      // --- Task Management ---
 
-     // Method for the command to set the running bulk import task
      public void setBulkImportTask(StatsSyncTask runnable, BukkitTask task) {
         if (this.bulkImportBukkitTask != null && !this.bulkImportBukkitTask.isCancelled()) {
             this.bulkImportBukkitTask.cancel();
@@ -194,44 +182,36 @@ public final class StatsExporterPlugin extends JavaPlugin {
         this.bulkImportBukkitTask = task;
     }
 
-    // Clear references when bulk import finishes or is cancelled
     public void clearBulkImportTaskReferences() {
          this.bulkImportRunnable = null;
          this.bulkImportBukkitTask = null;
          debug("Cleared bulk import task references.");
      }
 
-     // Cancel the bulk import task if it's running
      public void cancelBulkImportTask() {
-         if (isBulkImportRunning()) { // Use the status check method
+         if (isBulkImportRunning()) {
              getLogger().info("Attempting to cancel bulk import task...");
              if (bulkImportRunnable != null) {
                  try {
-                     bulkImportRunnable.cancel(); // This should trigger cleanup in the task
-                     // References are cleared within the task's cleanup logic
+                     bulkImportRunnable.cancel();
                  } catch (IllegalStateException e) {
                      debug("Bulk import task runnable already cancelled or finished.");
-                     // Ensure refs are cleared if cancel throws exception
                      if (bulkImportBukkitTask != null && !bulkImportBukkitTask.isCancelled()) {
                          bulkImportBukkitTask.cancel();
                      }
                      clearBulkImportTaskReferences();
                  }
              } else if (bulkImportBukkitTask != null && !bulkImportBukkitTask.isCancelled()) {
-                 // Fallback if runnable ref is somehow null but BukkitTask exists
                  getLogger().warning("Bulk import runnable reference was null, cancelling BukkitTask directly.");
                  bulkImportBukkitTask.cancel();
-                 clearBulkImportTaskReferences(); // Clear refs here since task cleanup won't run
+                 clearBulkImportTaskReferences();
              }
          } else {
              debug("No active bulk import task to cancel.");
          }
      }
 
-
-     // Check if bulk import is running using the flag in the task runnable
      public boolean isBulkImportRunning() {
-         // Check both the runnable flag and ensure the BukkitTask itself hasn't been cancelled
          return this.bulkImportRunnable != null
                 && this.bulkImportRunnable.isTaskRunning()
                 && this.bulkImportBukkitTask != null
@@ -261,6 +241,6 @@ public final class StatsExporterPlugin extends JavaPlugin {
      }
 
     public void debug(String message) {
-         log(Level.INFO, message); // Uses the main log method
+         log(Level.INFO, message);
     }
 }

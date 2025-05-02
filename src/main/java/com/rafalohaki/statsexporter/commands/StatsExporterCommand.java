@@ -2,8 +2,10 @@ package com.rafalohaki.statsexporter.commands;
 
 import com.rafalohaki.statsexporter.StatsExporterPlugin;
 import com.rafalohaki.statsexporter.tasks.StatsSyncTask;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration; // Import needed
 import org.bukkit.Bukkit;
-import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -18,21 +20,27 @@ import java.util.stream.Collectors;
 public class StatsExporterCommand implements CommandExecutor {
 
     private final StatsExporterPlugin plugin;
-    private final String prefix = ChatColor.GRAY + "[" + ChatColor.GOLD + "StatsExporter" + ChatColor.GRAY + "] " + ChatColor.YELLOW;
+    private final Component prefix;
 
     public StatsExporterCommand(StatsExporterPlugin plugin) {
         this.plugin = plugin;
+        this.prefix = Component.text()
+            .append(Component.text("[", NamedTextColor.GRAY))
+            .append(Component.text("StatsExporter", NamedTextColor.GOLD))
+            .append(Component.text("] ", NamedTextColor.GRAY))
+            .color(NamedTextColor.YELLOW)
+            .build();
     }
 
     @Override
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
         if (!sender.hasPermission("statsexporter.admin")) {
-            sender.sendMessage(ChatColor.RED + "You do not have permission to use this command.");
+            sender.sendMessage(Component.text("You do not have permission to use this command.", NamedTextColor.RED));
             return true;
         }
 
         if (args.length == 0) {
-            sendUsage(sender, label); // <<< --- Pass label here --- <<<
+            sendUsage(sender, label);
             return true;
         }
 
@@ -48,37 +56,41 @@ public class StatsExporterCommand implements CommandExecutor {
             case "status":
                 handleStatus(sender);
                 break;
-            // Add "cancelimport" subcommand
             case "cancelimport":
                  handleCancelImport(sender);
                  break;
             default:
-                sender.sendMessage(prefix + ChatColor.RED + "Unknown subcommand: " + args[0]);
-                sendUsage(sender, label); // <<< --- Pass label here --- <<<
+                sender.sendMessage(prefix.append(Component.text("Unknown subcommand: " + args[0], NamedTextColor.RED)));
+                sendUsage(sender, label);
                 break;
         }
 
         return true;
     }
 
-    // <<< --- Modify method signature to accept label --- <<<
     private void sendUsage(CommandSender sender, String commandLabel) {
-        sender.sendMessage(prefix + "Usage:");
-        // <<< --- Use commandLabel parameter instead of label --- <<<
-        sender.sendMessage(ChatColor.GOLD + "/" + commandLabel + " importvanilla" + ChatColor.GRAY + " - Starts bulk import from vanilla stats files.");
-        sender.sendMessage(ChatColor.GOLD + "/" + commandLabel + " cancelimport" + ChatColor.GRAY + " - Stops the current bulk import task.");
-        sender.sendMessage(ChatColor.GOLD + "/" + commandLabel + " reload" + ChatColor.GRAY + " - Reloads the plugin configuration.");
-        sender.sendMessage(ChatColor.GOLD + "/" + commandLabel + " status" + ChatColor.GRAY + " - Shows current plugin status.");
+        sender.sendMessage(prefix.append(Component.text("Usage:")));
+        sender.sendMessage(Component.text()
+                .append(Component.text("/" + commandLabel + " importvanilla", NamedTextColor.GOLD))
+                .append(Component.text(" - Starts bulk import from vanilla stats files.", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text()
+                .append(Component.text("/" + commandLabel + " cancelimport", NamedTextColor.GOLD))
+                .append(Component.text(" - Stops the current bulk import task.", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text()
+                .append(Component.text("/" + commandLabel + " reload", NamedTextColor.GOLD))
+                .append(Component.text(" - Reloads the plugin configuration.", NamedTextColor.GRAY)));
+        sender.sendMessage(Component.text()
+                .append(Component.text("/" + commandLabel + " status", NamedTextColor.GOLD))
+                .append(Component.text(" - Shows current plugin status.", NamedTextColor.GRAY)));
     }
 
     private void handleImportVanilla(CommandSender sender) {
-        // Use the improved check from the main plugin class
         if (plugin.isBulkImportRunning()) {
-            sender.sendMessage(prefix + ChatColor.RED + "A bulk import task is already running. Use /" + "statsexporter" + " cancelimport to stop it first."); // Consider using the command label/alias here too, but "statsexporter" is safe.
+            sender.sendMessage(prefix.append(Component.text("A bulk import task is already running. Use /" + "statsexporter" + " cancelimport to stop it first.", NamedTextColor.RED)));
             return;
         }
 
-        sender.sendMessage(prefix + "Starting vanilla stats bulk import...");
+        sender.sendMessage(prefix.append(Component.text("Starting vanilla stats bulk import...")));
         plugin.debug("Initiating bulk import process via command...");
 
         List<UUID> uuidsToImport;
@@ -86,98 +98,106 @@ public class StatsExporterCommand implements CommandExecutor {
              uuidsToImport = plugin.getStatsFileReader().getAllPlayerUUIDsInStatsDir().collect(Collectors.toList());
         } catch (Exception e) {
              plugin.log(Level.SEVERE, "Failed to list UUIDs from stats directory during import command.", e);
-             sender.sendMessage(prefix + ChatColor.RED + "Error listing player files. Check console for details.");
+             sender.sendMessage(prefix.append(Component.text("Error listing player files. Check console for details.", NamedTextColor.RED)));
              return;
         }
 
         if (uuidsToImport.isEmpty()) {
-            sender.sendMessage(prefix + ChatColor.YELLOW + "No player statistic files found in the stats directory.");
+            sender.sendMessage(prefix.append(Component.text("No player statistic files found in the stats directory.")));
             plugin.debug("Bulk import command found no UUIDs to process.");
             return;
         }
 
         int totalFiles = uuidsToImport.size();
-        sender.sendMessage(prefix + "Found " + ChatColor.GOLD + totalFiles + ChatColor.YELLOW + " player stat files to process.");
+        sender.sendMessage(prefix.append(Component.text("Found "))
+            .append(Component.text(totalFiles, NamedTextColor.GOLD))
+            .append(Component.text(" player stat files to process.")));
         plugin.log(Level.INFO, "Starting bulk import of " + totalFiles + " player stats files, requested by " + sender.getName());
 
         long playersPerTick = plugin.getPluginConfig().getLong("import.playersPerTick", 2);
         long delayTicks = plugin.getPluginConfig().getLong("import.delayBetweenPlayersTicks", 0);
-        long period = Math.max(1L, delayTicks); // Ensure period is at least 1 tick
+        long period = Math.max(1L, delayTicks);
 
         try {
             StatsSyncTask bulkImportRunnable = new StatsSyncTask(plugin, uuidsToImport);
 
+            // Use explicit Runnable to silence deprecation warning
+            Runnable taskAsRunnable = bulkImportRunnable;
             BukkitTask task = Bukkit.getScheduler().runTaskTimerAsynchronously(
                     plugin,
-                    bulkImportRunnable,
-                    20L, // Start after 1 second delay
+                    taskAsRunnable, // Pass the Runnable
+                    20L,            // Start after 1 second delay
                     period
             );
 
-            // Store references in the main plugin class
             plugin.setBulkImportTask(bulkImportRunnable, task);
 
-            sender.sendMessage(prefix + "Bulk import task scheduled. Processing approx. " +
-                               playersPerTick + " players every " + period + " ticks.");
-            sender.sendMessage(prefix + "Use " + ChatColor.GOLD + "/" + "statsexporter" + " cancelimport" + ChatColor.YELLOW + " to stop."); // Consider using the command label/alias here too
+            sender.sendMessage(prefix.append(Component.text("Bulk import task scheduled. Processing approx. " +
+                               playersPerTick + " players every " + period + " ticks.")));
+            sender.sendMessage(prefix.append(Component.text("Use "))
+                .append(Component.text("/" + "statsexporter" + " cancelimport", NamedTextColor.GOLD))
+                .append(Component.text(" to stop.")));
 
         } catch (Exception e) {
             plugin.log(Level.SEVERE, "Failed to schedule bulk import task!", e);
-            sender.sendMessage(prefix + ChatColor.RED + "Error scheduling bulk import task. Check console.");
-            plugin.clearBulkImportTaskReferences(); // Ensure references are cleared on error
+            sender.sendMessage(prefix.append(Component.text("Error scheduling bulk import task. Check console.", NamedTextColor.RED)));
+            plugin.clearBulkImportTaskReferences();
         }
     }
 
      private void handleCancelImport(CommandSender sender) {
         if (!plugin.isBulkImportRunning()) {
-            sender.sendMessage(prefix + ChatColor.RED + "No bulk import task is currently running.");
+            sender.sendMessage(prefix.append(Component.text("No bulk import task is currently running.", NamedTextColor.RED)));
             return;
         }
 
-        sender.sendMessage(prefix + "Attempting to cancel the bulk import task...");
-        plugin.cancelBulkImportTask(); // Add this method to StatsExporterPlugin
+        sender.sendMessage(prefix.append(Component.text("Attempting to cancel the bulk import task...")));
+        plugin.cancelBulkImportTask();
 
-        // Check status again after a short delay (cancellation might take a tick)
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
             if (!plugin.isBulkImportRunning()) {
-                sender.sendMessage(prefix + ChatColor.GREEN + "Bulk import task cancelled successfully.");
+                sender.sendMessage(prefix.append(Component.text("Bulk import task cancelled successfully.", NamedTextColor.GREEN)));
                 plugin.log(Level.INFO, "Bulk import task cancelled by " + sender.getName());
             } else {
-                sender.sendMessage(prefix + ChatColor.RED + "Failed to cancel the bulk import task. It might have already finished or an error occurred.");
+                sender.sendMessage(prefix.append(Component.text("Failed to cancel the bulk import task. It might have already finished or an error occurred.", NamedTextColor.RED)));
             }
-        }, 2L); // Check after 2 ticks
+        }, 2L);
     }
 
-
     private void handleReload(CommandSender sender) {
-        sender.sendMessage(prefix + "Reloading configuration...");
+        sender.sendMessage(prefix.append(Component.text("Reloading configuration...")));
         plugin.reloadConfig();
-        // Reload config values that might be used by components directly
-        // Note: API URL/Key changes in HttpUtils or OkHttp client settings usually need a restart/plugin reload
-        sender.sendMessage(prefix + ChatColor.GREEN + "Configuration reloaded. Critical changes like API URL/Key may require a plugin restart (/plugman reload StatsExporter or server restart).");
+        sender.sendMessage(prefix.append(Component.text("Configuration reloaded. Critical changes like API URL/Key may require a plugin restart (/plugman reload StatsExporter or server restart).", NamedTextColor.GREEN)));
         plugin.log(Level.INFO, "Configuration reloaded via command by " + sender.getName());
     }
 
     private void handleStatus(CommandSender sender) {
-         sender.sendMessage(prefix + ChatColor.UNDERLINE + "StatsExporter Status:");
-         sender.sendMessage(ChatColor.YELLOW + " Version: " + ChatColor.WHITE + plugin.getDescription().getVersion());
-         sender.sendMessage(ChatColor.YELLOW + " API Endpoint: " + ChatColor.WHITE + plugin.getPluginConfig().getString("api.url"));
-         sender.sendMessage(ChatColor.YELLOW + " Debug Mode: " + ChatColor.WHITE + plugin.getPluginConfig().getBoolean("debug", false));
-         sender.sendMessage(ChatColor.YELLOW + " Sync on Quit: " + ChatColor.WHITE + plugin.getPluginConfig().getBoolean("sync.onQuit", true));
+         // Correctly apply decoration using .decorate() and TextDecoration.UNDERLINED
+         sender.sendMessage(prefix.append(Component.text("StatsExporter Status:").decorate(TextDecoration.UNDERLINED))); // <-- FIX APPLIED HERE
+
+         sender.sendMessage(Component.text(" Version: ", NamedTextColor.YELLOW)
+             .append(Component.text(plugin.getPluginMeta().getVersion(), NamedTextColor.WHITE)));
+         sender.sendMessage(Component.text(" API Endpoint: ", NamedTextColor.YELLOW)
+             .append(Component.text(plugin.getPluginConfig().getString("api.url", "Not Set"), NamedTextColor.WHITE)));
+         sender.sendMessage(Component.text(" Debug Mode: ", NamedTextColor.YELLOW)
+             .append(Component.text(plugin.getPluginConfig().getBoolean("debug", false), NamedTextColor.WHITE)));
+         sender.sendMessage(Component.text(" Sync on Quit: ", NamedTextColor.YELLOW)
+             .append(Component.text(plugin.getPluginConfig().getBoolean("sync.onQuit", true), NamedTextColor.WHITE)));
 
          boolean periodicEnabled = plugin.getPluginConfig().getBoolean("sync.periodicOnlineSync", true);
-         sender.sendMessage(ChatColor.YELLOW + " Periodic Sync: " + ChatColor.WHITE + periodicEnabled +
-                            (periodicEnabled ?
-                             " (" + plugin.getPluginConfig().getLong("sync.periodicOnlineSyncIntervalMinutes", 20) + " min interval)" : ""));
+         sender.sendMessage(Component.text(" Periodic Sync: ", NamedTextColor.YELLOW)
+             .append(Component.text(periodicEnabled, NamedTextColor.WHITE))
+             .append(periodicEnabled ? Component.text(" (" + plugin.getPluginConfig().getLong("sync.periodicOnlineSyncIntervalMinutes", 20) + " min interval)", NamedTextColor.WHITE) : Component.empty()));
 
          boolean importRunning = plugin.isBulkImportRunning();
-         sender.sendMessage(ChatColor.YELLOW + " Bulk Import Active: " + (importRunning ? ChatColor.GREEN + "Yes" : ChatColor.RED + "No"));
+         sender.sendMessage(Component.text(" Bulk Import Active: ", NamedTextColor.YELLOW)
+             .append(importRunning ? Component.text("Yes", NamedTextColor.GREEN) : Component.text("No", NamedTextColor.RED)));
 
-         // Add queue size info from HttpUtils (needs a getter method)
          if (plugin.getHttpUtils() != null) {
-            sender.sendMessage(ChatColor.YELLOW + " Current Upload Queue Size: " + ChatColor.WHITE + plugin.getHttpUtils().getQueueSize());
+            sender.sendMessage(Component.text(" Current Upload Queue Size: ", NamedTextColor.YELLOW)
+                .append(Component.text(plugin.getHttpUtils().getQueueSize(), NamedTextColor.WHITE)));
          }
 
-         sender.sendMessage(ChatColor.GRAY + "--------------------");
+         sender.sendMessage(Component.text("--------------------", NamedTextColor.GRAY));
     }
 }

@@ -3,9 +3,11 @@ package com.rafalohaki.statsexporter.utils;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.rafalohaki.statsexporter.StatsExporterPlugin;
-import okhttp3.*; // Import OkHttp classes
+import okhttp3.*;
 import org.bukkit.Bukkit;
 import org.jetbrains.annotations.NotNull;
+// Import PluginMeta if needed, though often implicitly available via Paper API dependency
+// import io.papermc.paper.plugin.configuration.PluginMeta;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -26,10 +28,10 @@ public class HttpUtils {
     private final String apiKey;
     private final int batchMaxSize;
     private final long batchMaxDelayMillis;
+    private final String userAgent; // Store user agent string
 
     private final Queue<Map<String, Object>> batchQueue = new ConcurrentLinkedQueue<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            // Use a ThreadFactory to name the scheduler thread for easier debugging
             r -> new Thread(r, "StatsExporter-HttpUtils-Scheduler")
     );
     private ScheduledFuture<?> scheduledSendTask;
@@ -46,6 +48,9 @@ public class HttpUtils {
         this.batchMaxSize = plugin.getPluginConfig().getInt("batch.maxSize", 50);
         this.batchMaxDelayMillis = plugin.getPluginConfig().getLong("batch.maxDelaySeconds", 15) * 1000;
 
+        // Use plugin.getPluginMeta() instead of plugin.getDescription()
+        this.userAgent = "StatsExporterPlugin/" + plugin.getPluginMeta().getVersion();
+
         if (batchMaxDelayMillis > 0) {
            startDelayedSendTask();
         }
@@ -59,24 +64,19 @@ public class HttpUtils {
             plugin.debug("Queued player data. Queue size: " + batchQueue.size());
         } else {
             plugin.log(Level.WARNING, "Failed to add player data to the queue (queue might be full or restricted).");
-            return; // Don't proceed if queueing failed
+            return;
         }
-
 
         if (batchQueue.size() >= batchMaxSize) {
             plugin.debug("Batch size reached (" + batchQueue.size() + "/" + batchMaxSize + "). Triggering send.");
             cancelScheduledSendTask();
-            // Ensure sendBatchAsync is called on a Bukkit async thread
             Bukkit.getScheduler().runTaskAsynchronously(plugin, this::sendBatchAsync);
         } else if (batchMaxDelayMillis > 0 && scheduledSendTask == null) {
-             // Reschedule timed send only if one isn't already pending
              startDelayedSendTask();
         }
     }
 
-
     private void startDelayedSendTask() {
-         // Double check condition and ensure scheduler is active
          if (batchMaxDelayMillis <= 0 || scheduledSendTask != null || scheduler.isShutdown()) {
              return;
          }
@@ -84,7 +84,6 @@ public class HttpUtils {
          try {
             scheduledSendTask = scheduler.schedule(() -> {
                  plugin.debug("Scheduled delay elapsed. Triggering async batch send via Bukkit Scheduler.");
-                 // Always dispatch the actual sending via Bukkit's async scheduler for thread safety
                  Bukkit.getScheduler().runTaskAsynchronously(plugin, this::sendBatchAsync);
                  scheduledSendTask = null;
             }, batchMaxDelayMillis, TimeUnit.MILLISECONDS);
@@ -96,11 +95,10 @@ public class HttpUtils {
     private void cancelScheduledSendTask() {
          if (scheduledSendTask != null) {
              plugin.debug("Cancelling scheduled batch send task.");
-             scheduledSendTask.cancel(false); // false = don't interrupt if already running
+             scheduledSendTask.cancel(false);
              scheduledSendTask = null;
          }
     }
-
 
     public void sendBatchAsync() {
         if (!sendLock.compareAndSet(false, true)) {
@@ -108,7 +106,6 @@ public class HttpUtils {
             return;
         }
 
-        // Double check queue emptiness after acquiring lock
         if (batchQueue.isEmpty()) {
             plugin.debug("Batch queue is empty after acquiring lock. Nothing to send.");
             sendLock.set(false);
@@ -123,7 +120,7 @@ public class HttpUtils {
                 batchToSend.add(data);
                 count++;
             } else {
-                break; // Stop if poll returns null (shouldn't happen with ConcurrentLinkedQueue unless empty)
+                break;
             }
         }
 
@@ -141,7 +138,6 @@ public class HttpUtils {
         } catch (Exception e) {
             plugin.log(Level.SEVERE, "Failed to serialize batch data to JSON: " + e.getMessage(), e);
             sendLock.set(false);
-            // Data in batchToSend is lost here. Consider alternative handling (e.g., saving to file).
             return;
         }
 
@@ -149,7 +145,7 @@ public class HttpUtils {
         Request request = new Request.Builder()
                 .url(this.apiUrl)
                 .header("Authorization", "Bearer " + this.apiKey)
-                .header("User-Agent", "StatsExporterPlugin/" + plugin.getDescription().getVersion())
+                .header("User-Agent", this.userAgent) // Use stored user agent
                 .post(body)
                 .build();
 
@@ -158,15 +154,9 @@ public class HttpUtils {
             public void onFailure(@NotNull Call call, @NotNull IOException e) {
                 try {
                     plugin.log(Level.WARNING, "Failed to send stats batch to API: " + e.getMessage());
-                    // Example: Re-queue failed batch (careful about infinite loops)
-                    // if (batchToSend.size() < batchMaxSize) { // Avoid re-queueing full batches?
-                    //    plugin.debug("Re-queueing " + batchToSend.size() + " failed entries.");
-                    //    batchQueue.addAll(batchToSend);
-                    // } else {
-                    //    plugin.log(Level.SEVERE, "Dropping failed batch of size " + batchToSend.size() + " due to potential loop.");
-                    // }
+                    // Consider adding retry logic or saving failed batches here
                 } finally {
-                     sendLock.set(false); // Release lock
+                     sendLock.set(false);
                 }
             }
 
@@ -177,14 +167,13 @@ public class HttpUtils {
                         plugin.debug("Successfully sent stats batch. Response code: " + response.code());
                     } else {
                         String responseBodyString = responseBody != null ? responseBody.string() : "[No Response Body]";
-                        plugin.log(Level.WARNING,"API endpoint returned an error. Code: " + response.code() + ", Response: " + responseBodyString.substring(0, Math.min(responseBodyString.length(), 500))); // Limit log size
+                        plugin.log(Level.WARNING,"API endpoint returned an error. Code: " + response.code() + ", Response: " + responseBodyString.substring(0, Math.min(responseBodyString.length(), 500)));
                     }
                 } catch (IOException e) {
                      plugin.log(Level.WARNING, "IOException while reading API response body: " + e.getMessage());
                 } finally {
-                     sendLock.set(false); // Release lock
+                     sendLock.set(false);
                      lastSendTime.set(System.currentTimeMillis());
-                     // Check if more data exists and schedule timed send if needed
                      if (!batchQueue.isEmpty() && batchMaxDelayMillis > 0) {
                         startDelayedSendTask();
                      }
@@ -192,7 +181,6 @@ public class HttpUtils {
             }
         });
     }
-
 
     public void flushBatchSync() {
         plugin.log(Level.INFO, "Flushing remaining data synchronously...");
@@ -206,9 +194,8 @@ public class HttpUtils {
             }
         }
 
-        try { // Wrap synchronous part in try-finally to ensure lock release
+        try {
             List<Map<String, Object>> batchToSend = new ArrayList<>();
-            // Drain the entire queue safely
             Map<String, Object> data;
             while ((data = batchQueue.poll()) != null) {
                 batchToSend.add(data);
@@ -216,7 +203,7 @@ public class HttpUtils {
 
             if (batchToSend.isEmpty()) {
                 plugin.log(Level.INFO, "No data in queue to flush.");
-                return; // Return within try block after logging
+                return;
             }
 
              plugin.log(Level.INFO, "Attempting to send " + batchToSend.size() + " remaining entries synchronously.");
@@ -226,14 +213,15 @@ public class HttpUtils {
                 jsonPayload = gson.toJson(batchToSend);
             } catch (Exception e) {
                 plugin.log(Level.SEVERE, "Failed to serialize final batch data to JSON: " + e.getMessage(), e);
-                return; // Return within try block
+                return;
             }
 
             RequestBody body = RequestBody.create(jsonPayload, MediaType.get("application/json; charset=utf-8"));
             Request request = new Request.Builder()
                     .url(this.apiUrl)
                     .header("Authorization", "Bearer " + this.apiKey)
-                    .header("User-Agent", "StatsExporterPlugin/" + plugin.getDescription().getVersion() + " (SyncFlush)")
+                    // Use stored user agent + suffix
+                    .header("User-Agent", this.userAgent + " (SyncFlush)")
                     .post(body)
                     .build();
 
@@ -250,7 +238,7 @@ public class HttpUtils {
                 plugin.log(Level.SEVERE, "Failed to send final batch synchronously: " + e.getMessage(), e);
             }
         } finally {
-             sendLock.set(false); // Ensure lock is always released
+             sendLock.set(false);
         }
     }
 
@@ -271,7 +259,6 @@ public class HttpUtils {
         }
     }
 
-    // Added getter for queue size (used by status command)
     public int getQueueSize() {
         return batchQueue.size();
     }
