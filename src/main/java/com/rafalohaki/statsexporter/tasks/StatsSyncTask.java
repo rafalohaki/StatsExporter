@@ -17,425 +17,494 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
+/**
+ * Handles synchronization of player statistics, operating in two modes:
+ * 1. Periodic Sync: Regularly syncs stats for currently online players.
+ * 2. Bulk Import: Processes all player stat files from the stats directory, typically triggered by a command.
+ */
 public class StatsSyncTask extends BukkitRunnable {
 
     private final StatsExporterPlugin plugin;
     private final HttpUtils httpUtils;
     private final StatsFileReader statsFileReader;
-    private final Executor bukkitExecutor; // Bukkit's async executor
+    private final Executor bukkitExecutor; // Executor using Bukkit's async scheduler
 
     // Task Mode specifics
     private final boolean isBulkImport;
-    private Iterator<UUID> bulkImportIterator; // Iterator for UUIDs in bulk mode
+    private final Iterator<UUID> bulkImportIterator; // Iterator for UUIDs in bulk mode
     private final int playersPerTick;          // How many players to process per tick in bulk mode
     private final int totalToProcess;          // Total UUIDs in the bulk import list
     private final AtomicInteger processedCount = new AtomicInteger(0); // Counter for processed players in bulk mode
-    private Instant importStartTime;           // Start time for bulk import duration calculation
-    private final AtomicBoolean isRunning = new AtomicBoolean(false); // Tracks if the task *logic* is actively running (especially for bulk import)
+    private final Instant importStartTime;           // Start time for bulk import duration calculation
+    private final AtomicBoolean isRunning = new AtomicBoolean(false); // Tracks if the bulk import *logic* is actively running
+    private final AtomicInteger runCounter = new AtomicInteger(0); // Counter for run() calls for debugging
 
-
-    // Constructor for Periodic Sync mode (online players)
+    /**
+     * Constructor for Periodic Sync mode (online players).
+     * @param plugin The main plugin instance.
+     */
     public StatsSyncTask(StatsExporterPlugin plugin) {
         this.plugin = plugin;
         this.httpUtils = plugin.getHttpUtils();
         this.statsFileReader = plugin.getStatsFileReader();
         this.isBulkImport = false;
-        this.playersPerTick = 0; // Not used in periodic mode
-        this.totalToProcess = 0; // Not used in periodic mode
-        this.bulkImportIterator = null; // Not used in periodic mode
+        this.playersPerTick = 0; // Not used
+        this.totalToProcess = 0; // Not used
+        this.bulkImportIterator = null; // Not used
+        this.importStartTime = null; // Not used
         this.bukkitExecutor = runnable -> Bukkit.getScheduler().runTaskAsynchronously(plugin, runnable);
-        // isRunning flag is primarily for bulk import state, not strictly needed for periodic
+        // Optional: Log creation if needed
+        // plugin.debug("StatsSyncTask created for Periodic Sync.");
     }
 
-    // Constructor for Bulk Import mode (all player files)
+    /**
+     * Constructor for Bulk Import mode (all player files).
+     * @param plugin The main plugin instance.
+     * @param uuidsToImport List of player UUIDs to process.
+     */
     public StatsSyncTask(StatsExporterPlugin plugin, List<UUID> uuidsToImport) {
         this.plugin = plugin;
         this.httpUtils = plugin.getHttpUtils();
         this.statsFileReader = plugin.getStatsFileReader();
         this.isBulkImport = true;
-        // Read config values within the constructor or pass them if needed
         this.playersPerTick = Math.max(1, plugin.getPluginConfig().getInt("import.playersPerTick", 2)); // Ensure at least 1
-        this.totalToProcess = uuidsToImport.size();
-        this.bulkImportIterator = uuidsToImport.iterator();
+        this.totalToProcess = (uuidsToImport != null) ? uuidsToImport.size() : 0;
+        this.bulkImportIterator = (uuidsToImport != null) ? uuidsToImport.iterator() : Collections.emptyIterator();
         this.importStartTime = Instant.now();
         this.bukkitExecutor = runnable -> Bukkit.getScheduler().runTaskAsynchronously(plugin, runnable);
-        // isRunning starts as false, set to true when run() first executes in bulk mode
+        plugin.debug("StatsSyncTask created for Bulk Import (" + totalToProcess + " players, " + playersPerTick + " per tick).");
     }
 
-
+    /**
+     * Main execution logic called by the Bukkit scheduler.
+     */
     @Override
     public void run() {
-        // --- Robust Cancellation Check at Start ---
-        // Check Bukkit's cancellation status first using our helper method.
-        if (isBukkitTaskCancelled()) {
-            plugin.debug("Task run() called but Bukkit reports already cancelled (checked via helper).");
-            // If it was a bulk import that was running, ensure cleanup happens
+        int currentRunCount = runCounter.incrementAndGet();
+        int taskId = -1; // Default Task ID if retrieval fails
+        try {
+             // Try to get ID for logging, but don't rely on it for critical logic early on
+             taskId = getTaskId();
+        } catch (IllegalStateException e) {
+            // Log only on the first run if ID isn't available yet
+            if (currentRunCount == 1) {
+                plugin.log(Level.WARNING, "!!! StatsSyncTask (ID unknown) run() #1 entered but couldn't get Task ID immediately. isBulkImport=" + isBulkImport);
+            }
+            // For subsequent runs, this would be highly unusual unless the task was externally cancelled and somehow restarted by Bukkit.
+        }
+        final int finalTaskId = taskId; // Make task ID effectively final for use in lambdas/logging
+
+        if (finalTaskId != -1) {
+             plugin.log(Level.INFO, "!!! StatsSyncTask (" + finalTaskId + ") run() method ENTERED #" + currentRunCount + ". isBulkImport=" + isBulkImport);
+        }
+
+        // --- Primary Cancellation Check ---
+        if (isBukkitTaskCancelled(finalTaskId)) { // Use the fixed helper method
+            plugin.log(Level.WARNING,"!!! StatsSyncTask (" + finalTaskId + ") run() ENTERED but task is cancelled.");
             if (isBulkImport && isRunning.get()) {
-                cleanupBulkImport(false); // Mark as not finished naturally
+                cleanupBulkImport(false, finalTaskId); // Cancelled externally
             }
             return; // Do not proceed
         }
-        // --- End Robust Cancellation Check ---
 
         // --- Execute Task Logic based on Mode ---
-        if (isBulkImport) {
-            // Set running flag only for bulk import mode when it first starts
-            // and ensure the iterator is valid
-            if (!isRunning.get() && bulkImportIterator != null && bulkImportIterator.hasNext()) {
-                isRunning.set(true);
-                plugin.debug("Bulk import task thread started execution.");
-            }
-
-            // Perform one tick's worth of bulk import work using the refactored method
-            runBulkImportTick(); // This method might trigger cleanup if it finishes/cancels
-
-            // --- Explicit Bukkit Cancellation on Completion ---
-            // After the tick runs, check if the *logic* is now stopped (isRunning is false).
-            // If it is, explicitly tell the Bukkit scheduler to cancel this repeating task.
-            // Also check if the iterator was initialized to avoid issues if it was never started.
-            if (!isRunning.get() && bulkImportIterator != null) {
-                plugin.debug("Bulk import finished or was stopped, cancelling Bukkit task from run() method.");
-                try {
-                    this.cancel(); // Tell Bukkit scheduler THIS task is done and should not run again.
-                } catch (IllegalStateException e) {
-                    // This might happen if the task was cancelled externally *exactly* between
-                    // runBulkImportTick finishing and this check. It's safe to ignore.
-                    plugin.debug("Attempted to self-cancel task from run(), but it was already cancelled/finished.");
-                }
-            }
-            // --- End Explicit Bukkit Cancellation ---
-
-        } else { // Periodic Sync Mode
-            runPeriodicSync();
-            // Periodic tasks don't typically self-cancel; they run until the plugin disables
-            // or they are explicitly cancelled externally.
-        }
-    }
-
-    // Override BukkitRunnable's cancel method to ensure internal state is cleaned up
-    // This is called by external cancellations (e.g., command, plugin disable)
-    // or by the self-cancellation in the run() method.
-    @Override
-    public synchronized void cancel() throws IllegalStateException {
-        plugin.debug("StatsSyncTask cancel() method invoked.");
-        // First, try to cancel via Bukkit's scheduler. This might throw if already cancelled.
         try {
-            super.cancel();
-        } catch (IllegalStateException e) {
-            plugin.debug("IllegalStateException calling super.cancel(), task likely already cancelled/finished. Proceeding with internal cleanup.");
-        } finally {
-            // Regardless of Bukkit's state, ensure our internal state is cleaned up,
-            // especially for bulk imports.
             if (isBulkImport) {
-                // Call cleanup, ensuring it only runs once via compareAndSet
-                cleanupBulkImport(false); // Assume external cancel means not finished normally
+                runBulkImportTickWrapper(finalTaskId);
+            } else {
+                runPeriodicSync(finalTaskId);
             }
-            // No specific cleanup needed for periodic sync beyond stopping the task
+        } catch (Throwable t) {
+            // Catch unexpected errors within the sync logic itself
+            plugin.log(Level.SEVERE, "!!! Uncaught exception in StatsSyncTask (" + finalTaskId + ") run() method !!! - Task will likely stop.", t);
+            if (isBulkImport) {
+                cleanupBulkImport(false, finalTaskId); // Ensure cleanup on unexpected error
+            }
+            // Cancel the task as it's in an unknown state
+            try {
+                cancel();
+            } catch (Exception e) {
+                plugin.log(Level.SEVERE, "Failed to cancel task (" + finalTaskId + ") after uncaught exception.", e);
+            }
         }
+         plugin.debug("!!! StatsSyncTask (" + finalTaskId + ") run() method EXITING #" + currentRunCount);
     }
-
-    // --- Refactored Bulk Import Logic ---
 
     /**
-     * Executes one tick of the bulk import process. Coordinates checking state,
-     * processing a batch, and handling completion or cancellation.
-     * Cognitive Complexity is significantly reduced.
+     * Wrapper for bulk import logic within the run() method's try-catch.
+     * Handles setting the initial running state.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
      */
-    private void runBulkImportTick() {
-        // 1. Initial State Check: Is the iterator valid and has elements?
-        if (bulkImportIterator == null || !bulkImportIterator.hasNext()) {
-            plugin.debug("Bulk import iterator is null or empty at start of tick, initiating cleanup.");
-            cleanupBulkImport(true); // Mark as finished (or already finished)
-            // run() will see !isRunning and cancel the Bukkit task.
+    private void runBulkImportTickWrapper(int taskId) {
+        plugin.debug("--- StatsSyncTask (" + taskId + ") run() - Entering Bulk Import Logic ---");
+
+        // Mark as running on the first execution tick if not already running
+        if (!isRunning.get() && bulkImportIterator != null && bulkImportIterator.hasNext()) {
+            if (isRunning.compareAndSet(false, true)) {
+                plugin.log(Level.INFO, "--- StatsSyncTask (" + taskId + ") Bulk import task commencing execution. ---");
+            } else {
+                // This might indicate a race condition or logic error if reached
+                plugin.log(Level.WARNING, "--- StatsSyncTask (" + taskId + ") Bulk import run() entered, but isRunning was already true?");
+            }
+        } else if (!isRunning.get()) {
+            // If run() is called but we are no longer marked as running (likely due to prior cleanup)
+            plugin.log(Level.WARNING, "--- StatsSyncTask (" + taskId + ") Bulk import run() called but isRunning is false. Iterator hasNext: " +
+                    (bulkImportIterator != null && bulkImportIterator.hasNext()) + ". Likely already cleaned up.");
+            // Ensure the task is actually cancelled in Bukkit's scheduler if it reached this state unexpectedly
+            if (!isBukkitTaskCancelled(taskId)) {
+                try { cancel(); } catch (Exception ignored) {}
+            }
+            return; // Stop execution for this tick
+        }
+
+        // Perform one tick's worth of bulk import work
+        runBulkImportTick(taskId);
+    }
+
+
+    /**
+     * Processes a batch of players for the bulk import during a single tick.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
+     */
+    private void runBulkImportTick(int taskId) {
+        plugin.debug(">>> StatsSyncTask (" + taskId + ") runBulkImportTick START");
+
+        // 1. Check if iterator has items (completion condition)
+        if (!bulkImportIterator.hasNext()) {
+            plugin.debug("--- runBulkImportTick (" + taskId + "): Iterator is empty, initiating natural cleanup.");
+            cleanupBulkImport(true, taskId); // Finished naturally
             return;
         }
 
-        // 2. Pre-Batch Cancellation Check (using helper)
-        if (isBukkitTaskCancelled()) {
-             plugin.debug("Bulk import tick detected cancellation before processing batch, initiating cleanup.");
-             cleanupBulkImport(false); // Cancelled
-             // run() will see !isRunning and cancel the Bukkit task.
+        // 2. Check for external cancellation *before* processing the batch
+        if (isBukkitTaskCancelled(taskId)) {
+             plugin.log(Level.INFO, "--- runBulkImportTick (" + taskId + "): Cancellation detected before processing batch. Cleaning up.");
+             cleanupBulkImport(false, taskId); // Cancelled externally
              return;
         }
 
         // 3. Process the Batch
-        List<CompletableFuture<Void>> batchFutures = processPlayerBatch();
+        plugin.debug(">>> runBulkImportTick (" + taskId + "): Processing player batch...");
+        List<CompletableFuture<Void>> batchFutures = processPlayerBatch(taskId); // Returns null if cancelled mid-batch
 
-        // 4. Post-Batch Cancellation Check (if processPlayerBatch detected cancellation)
-        // processPlayerBatch returns null if cancelled mid-batch
+        // 4. Handle potential cancellation *during* batch processing
         if (batchFutures == null) {
-             plugin.debug("Batch processing indicated cancellation, initiating cleanup.");
-             cleanupBulkImport(false); // Cancelled during batch
-             // run() will see !isRunning and cancel the Bukkit task.
+             plugin.log(Level.INFO, "--- runBulkImportTick (" + taskId + "): processPlayerBatch indicated cancellation mid-batch. Cleaning up.");
+             cleanupBulkImport(false, taskId); // Cancelled externally/mid-batch
              return;
         }
+        plugin.debug("<<< runBulkImportTick (" + taskId + "): Batch processing scheduled for " + batchFutures.size() + " players.");
 
-        // 5. Check if Import is Complete (Iterator finished?)
+        // 5. Check if this was the *last* batch
         if (!bulkImportIterator.hasNext()) {
-             handleFinalBatchCompletion(batchFutures);
-             // Note: cleanupBulkImport is called asynchronously within handleFinalBatchCompletion.
-             // The run() method will eventually detect !isRunning and cancel the Bukkit task.
+             plugin.debug("--- runBulkImportTick (" + taskId + "): Iterator is now empty. Handling final batch completion...");
+             handleFinalBatchCompletion(batchFutures, taskId);
         }
-        // If the iterator still has elements, the task continues to the next tick automatically.
+
+         plugin.debug("<<< StatsSyncTask (" + taskId + ") runBulkImportTick END");
     }
 
     /**
-     * Processes a batch of players from the iterator for the current tick.
-     * Handles mid-tick cancellation checks using the helper method.
-     *
-     * @return A list of CompletableFuture representing the processing of each player in the batch,
-     *         or null if the task was cancelled mid-batch.
+     * Processes up to `playersPerTick` players from the iterator.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
+     * @return A List of CompletableFuture for the processed players, or null if cancellation was detected mid-processing.
      */
-    private List<CompletableFuture<Void>> processPlayerBatch() {
+    private List<CompletableFuture<Void>> processPlayerBatch(int taskId) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         int processedThisTick = 0;
 
         for (int i = 0; i < playersPerTick && bulkImportIterator.hasNext(); i++) {
-             // Check for cancellation *inside* the loop for better responsiveness
-             if (isBukkitTaskCancelled()) {
-                 plugin.debug("Cancellation detected mid-batch processing loop.");
-                 return null; // Signal cancellation happened during the batch
+             // Check cancellation *inside* the loop for responsiveness
+             if (isBukkitTaskCancelled(taskId)) {
+                 plugin.debug("--- processPlayerBatch (" + taskId + "): Cancellation detected mid-loop.");
+                 return null; // Signal cancellation
              }
 
             UUID uuid = bulkImportIterator.next();
-            futures.add(processSinglePlayerStats(uuid));
+            futures.add(processSinglePlayerStats(uuid, taskId));
             processedThisTick++;
         }
-
-        plugin.debug("Scheduled processing for " + processedThisTick + " players this tick.");
+        plugin.debug("--- processPlayerBatch (" + taskId + "): Scheduled processing for " + processedThisTick + " players this tick.");
         return futures;
     }
 
     /**
-     * Asynchronously processes the statistics for a single player UUID.
-     * Reads stats, queues data, updates progress, and handles errors.
-     *
-     * @param uuid The UUID of the player to process.
-     * @return A CompletableFuture representing the completion of this player's processing.
+     * Creates a CompletableFuture to read, map, and queue stats for a single player UUID.
+     * @param uuid The player's UUID.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
+     * @return A CompletableFuture representing the async operation.
      */
-    private CompletableFuture<Void> processSinglePlayerStats(UUID uuid) {
+    private CompletableFuture<Void> processSinglePlayerStats(UUID uuid, int taskId) {
+        // Getting OfflinePlayer can involve I/O, do it async if needed, though usually fast
         OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(uuid);
+        String playerNameHint = offlinePlayer.getName(); // Get name for logging
+
+        plugin.debug("--- processing (" + taskId + "): Scheduling stats read for UUID: " + uuid + (playerNameHint != null ? " (" + playerNameHint + ")" : ""));
 
         return statsFileReader.getPlayerDataMapAsync(offlinePlayer)
-            .thenAcceptAsync(playerDataMap -> { // Process the result asynchronously
-                if (playerDataMap != null && !playerDataMap.isEmpty()) {
-                    httpUtils.queuePlayerData(playerDataMap);
+            .thenAcceptAsync(playerDataMap -> { // Runs after stats are read and mapped
+                // Check cancellation *again* before queueing
+                if (isBukkitTaskCancelled(taskId)) {
+                    plugin.debug("--- processing (" + taskId + "): Cancelled before queueing data for " + uuid);
+                    return;
                 }
-                // Increment count and log progress periodically
-                int currentCount = processedCount.incrementAndGet();
-                logProgressIfNeeded(currentCount);
-            }, bukkitExecutor) // Ensure this runs on Bukkit's async pool
-             .exceptionally(ex -> { // Handle errors for individual player processing
-                handlePlayerProcessingError(uuid, ex);
-                return null; // Required for exceptionally stage
+
+                if (playerDataMap != null && !playerDataMap.isEmpty()) {
+                    plugin.debug("--- processing (" + taskId + "): Successfully got data for " + uuid + ", queueing.");
+                    httpUtils.queuePlayerData(playerDataMap);
+                } else {
+                    plugin.debug("--- processing (" + taskId + "): No stats data found/read for " + uuid + ", skipping queue.");
+                }
+                // Increment and log progress *after* attempting to queue (or skipping)
+                logProgressIfNeeded(processedCount.incrementAndGet(), taskId);
+
+            }, bukkitExecutor) // Ensure this accept stage also runs async
+             .exceptionally(ex -> { // Handle errors during the stats reading/mapping phase
+                 if (!isBukkitTaskCancelled(taskId)) { // Log only if not cancelled
+                    plugin.log(Level.WARNING, "!!! Error processing stats during bulk import for UUID " + uuid + (playerNameHint != null ? " (" + playerNameHint + ")" : "") + ": " + ex.getMessage());
+                 }
+                 // Still increment count and log progress even if this player failed
+                 logProgressIfNeeded(processedCount.incrementAndGet(), taskId);
+                 return null; // Necessary for exceptionally block
              });
     }
 
     /**
-     * Waits for the final batch of futures to complete and initiates cleanup.
-     * Checks for cancellation using the helper method before marking as finished naturally.
-     *
-     * @param lastBatchFutures The list of futures from the last processed batch.
+     * Waits for the final batch of futures to complete and then triggers cleanup.
+     * @param lastBatchFutures The list of futures from the last processing tick.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
      */
-    private void handleFinalBatchCompletion(List<CompletableFuture<Void>> lastBatchFutures) {
-         plugin.debug("Bulk import iterator finished. Waiting for last batch futures.");
+    private void handleFinalBatchCompletion(List<CompletableFuture<Void>> lastBatchFutures, int taskId) {
+         plugin.debug("--- handleFinalBatchCompletion (" + taskId + "): Waiting for last " + lastBatchFutures.size() + " player futures...");
+
          CompletableFuture.allOf(lastBatchFutures.toArray(new CompletableFuture[0]))
-            .whenCompleteAsync((unused, throwable) -> {
-                 // Ensure cleanup happens after the last futures complete
-                 // Check cancellation status *after* waiting
-                 if (!isBukkitTaskCancelled()) {
-                    plugin.debug("Last batch futures complete. Initiating final cleanup (finished naturally).");
-                    cleanupBulkImport(true); // Mark as finished naturally
+            .whenCompleteAsync((unused, throwable) -> { // Runs after all futures in the batch complete
+                 plugin.debug("--- handleFinalBatchCompletion (" + taskId + "): Final batch futures completed.");
+                 if (throwable != null && !isBukkitTaskCancelled(taskId)) {
+                     // Log errors from the last batch if any occurred and we weren't cancelled
+                     plugin.log(Level.WARNING, "--- handleFinalBatchCompletion (" + taskId + "): Errors occurred in the final batch.", throwable);
+                 }
+
+                 // Double-check cancellation status before declaring natural finish
+                 if (!isBukkitTaskCancelled(taskId)) {
+                    plugin.debug("--- handleFinalBatchCompletion (" + taskId + "): Task not cancelled, initiating natural cleanup.");
+                    cleanupBulkImport(true, taskId); // Finished naturally
                  } else {
-                     plugin.debug("Task was cancelled while waiting for last batch futures. Cleanup likely already run or will be run by cancel().");
-                     // Cleanup might have already been triggered by cancel() override or run() check.
-                     // Ensure cleanup runs if somehow missed.
-                     if (isRunning.get()) { // Double-check if cleanup is needed
-                        cleanupBulkImport(false); // Cancelled
+                    plugin.log(Level.INFO, "--- handleFinalBatchCompletion (" + taskId + "): Task was cancelled while waiting for final batch. Cleanup should already be in progress/finished.");
+                    // Ensure cleanup runs if somehow missed
+                     if (isRunning.get()) {
+                        cleanupBulkImport(false, taskId); // Cancelled
                      }
                  }
-                 // The run() method should detect !isRunning and self-cancel the BukkitTask.
-             }, bukkitExecutor); // Use executor to avoid blocking scheduler thread if waiting is long
+             }, bukkitExecutor); // Run completion logic async
     }
 
     /**
-     * Logs bulk import progress periodically.
-     * @param currentCount The current number of processed players.
+     * Logs the bulk import progress periodically.
+     * @param currentCount The number of players processed so far.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
      */
-    private void logProgressIfNeeded(int currentCount) {
-         // Avoid spamming console, log every 100 or on the last one
-         if (currentCount % 100 == 0 || currentCount == totalToProcess) {
-            plugin.log(Level.INFO, "Bulk import progress: " + currentCount + "/" + totalToProcess);
+    private void logProgressIfNeeded(int currentCount, int taskId) {
+         // Log every 100 players or on the very last player
+         if (totalToProcess > 0 && (currentCount % 100 == 0 || currentCount == totalToProcess)) {
+            plugin.log(Level.INFO, "Bulk import progress (" + taskId + "): " + currentCount + "/" + totalToProcess);
          }
     }
 
-    /**
-     * Handles and logs errors encountered during single player processing in bulk import.
-     * Also ensures the progress counter is incremented even on error.
-     * @param uuid The UUID of the player that failed.
-     * @param ex The exception thrown.
-     * @return null (for CompletableFuture.exceptionally)
-     */
-    private Void handlePlayerProcessingError(UUID uuid, Throwable ex) {
-        plugin.log(Level.WARNING, "Error processing stats during bulk import for UUID " + uuid + ": " + ex.getMessage()); // Log warning
-        // Still count as processed *attempt* for progress tracking
-        int currentCountOnError = processedCount.incrementAndGet();
-        logProgressIfNeeded(currentCountOnError); // Log progress even on error if it hits a milestone
-        return null;
-    }
 
-    // --- Periodic Sync Logic (Online Players) ---
-    private void runPeriodicSync() {
-        // --- Check if cancelled before proceeding (using helper) ---
-        if (isBukkitTaskCancelled()) {
-             plugin.debug("Periodic sync cancelled before starting.");
+    /**
+     * Runs the periodic synchronization for online players.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
+     */
+    private void runPeriodicSync(int taskId) {
+        if (isBukkitTaskCancelled(taskId)) {
+             plugin.debug("Periodic sync (" + taskId + ") cancelled before starting.");
              return;
          }
-        // --- End Cancellation Check ---
 
-        plugin.debug("Running periodic online player sync...");
+        plugin.debug("--- Running Periodic Sync (" + taskId + ") ---");
         Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
 
         if (onlinePlayers.isEmpty()) {
-            plugin.debug("No players online for periodic sync.");
+            plugin.debug("Periodic sync (" + taskId + "): No players online.");
             return;
         }
 
+        plugin.debug("Periodic sync (" + taskId + "): Found " + onlinePlayers.size() + " online players.");
         AtomicInteger syncCount = new AtomicInteger(0);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-        boolean checkCancelMidLoop = false;
 
         for (Player player : onlinePlayers) {
-             // --- Added check for cancellation inside loop (using helper) ---
-             if (isBukkitTaskCancelled()) {
-                 checkCancelMidLoop = true;
-                 plugin.debug("Periodic sync cancelled mid-loop.");
-                 break; // Stop processing more players if task was cancelled
+             // Check cancellation inside the loop
+             if (isBukkitTaskCancelled(taskId)) {
+                 plugin.debug("Periodic sync (" + taskId + ") cancelled mid-loop.");
+                 break; // Stop processing more players for this cycle
              }
-             // --- End Cancellation Check ---
 
-             plugin.debug("Queueing periodic sync for online player: " + player.getName());
+             plugin.debug("Periodic sync (" + taskId + "): Queueing sync for online player: " + player.getName());
              CompletableFuture<Void> future = statsFileReader.getPlayerDataMapAsync(player)
                 .thenAcceptAsync(playerDataMap -> {
+                    // Check cancellation before queueing
+                     if (isBukkitTaskCancelled(taskId)) return;
+
                     if (playerDataMap != null && !playerDataMap.isEmpty()) {
                         httpUtils.queuePlayerData(playerDataMap);
                         syncCount.incrementAndGet();
+                         plugin.debug("Periodic sync (" + taskId + "): Queued data for " + player.getName());
+                    } else {
+                         plugin.debug("Periodic sync (" + taskId + "): No data found for " + player.getName());
                     }
-                }, bukkitExecutor) // Run on Bukkit's async pool
-                 .exceptionally(ex -> { // Handle individual player errors
-                     // Check cancellation again inside exceptionally block to avoid logging if cancelled
-                     if (!isBukkitTaskCancelled()) {
-                        plugin.log(Level.WARNING, "Error processing periodic sync stats for player " + player.getName() + ": " + ex.getMessage());
+                }, bukkitExecutor)
+                 .exceptionally(ex -> {
+                     if (!isBukkitTaskCancelled(taskId)) {
+                        plugin.log(Level.WARNING, "!!! Error in periodic sync for player " + player.getName() + ": " + ex.getMessage());
                      }
-                     return null; // Allow Promise.all to complete
+                     return null;
                  });
              futures.add(future);
         }
 
-         // If cancelled mid-loop, don't wait for futures or log completion
-         if (checkCancelMidLoop) {
-             plugin.debug("Periodic sync cancelled mid-loop. Not waiting for futures.");
-             return;
-         }
-
-         // Wait for all futures and log completion status
-         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((unused, throwable) -> {
-             // Check cancellation status *again* before logging completion message (using helper)
-             if (!isBukkitTaskCancelled()) {
-                 if (throwable == null) {
-                     plugin.debug("Periodic sync cycle completed. Successfully queued data for " + syncCount.get() + " online players.");
-                 } else {
-                     // Log general error if CompletableFuture.allOf failed (unlikely with exceptionally blocks)
-                     plugin.log(Level.WARNING, "Periodic sync cycle finished, but some errors occurred during processing.", throwable);
-                 }
-             } else {
-                  plugin.debug("Periodic sync task was cancelled while waiting for player futures.");
-             }
-         });
-    }
-
-    // --- Centralized Cleanup Logic for Bulk Import Task ---
-    // This method now focuses *only* on internal state cleanup and logging.
-    // It sets isRunning to false, which signals the run() method to cancel the Bukkit task.
-    private void cleanupBulkImport(boolean finishedNaturally) {
-         // Use compareAndSet to ensure this cleanup logic runs only once per task instance
-         if (isRunning.compareAndSet(true, false)) {
-             plugin.debug("CleanupBulkImport running (finishedNaturally=" + finishedNaturally + ")");
-             if (finishedNaturally) {
-                 Instant endTime = Instant.now();
-                 // Ensure importStartTime was initialized
-                 if (importStartTime != null) {
-                    Duration duration = Duration.between(importStartTime, endTime);
-                    plugin.log(Level.INFO, "Bulk import finished processing " + processedCount.get() + "/" + totalToProcess + " players in " + formatDuration(duration) + ".");
-                 } else {
-                     plugin.log(Level.INFO, "Bulk import finished processing " + processedCount.get() + "/" + totalToProcess + " players. (Start time unavailable)");
-                 }
-             } else {
-                 // Log message depends slightly on whether it was cancelled externally or finished partially
-                 plugin.log(Level.INFO, "Bulk import task stopped or cancelled after processing " + processedCount.get() + "/" + totalToProcess + " players.");
-             }
-             // Clear the references in the main plugin class to allow a new import task
-             plugin.clearBulkImportTaskReferences();
-
-             // The run() method is responsible for cancelling the BukkitTask
-             // after it detects that isRunning has become false.
-             plugin.debug("isRunning flag set to false by cleanupBulkImport.");
-         } else {
-             plugin.debug("CleanupBulkImport called but task was already marked as not running.");
+        // Wait for all scheduled futures for this cycle to complete (unless cancelled mid-loop)
+         if (!isBukkitTaskCancelled(taskId) && !futures.isEmpty()) {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((unused, throwable) -> {
+                if (!isBukkitTaskCancelled(taskId)) {
+                    plugin.debug("--- Periodic sync cycle (" + taskId + ") completed. Successfully queued data for " + syncCount.get() + " online players. ---");
+                    if (throwable != null) {
+                        plugin.log(Level.WARNING, "Periodic sync cycle (" + taskId + ") finished, but some errors occurred during processing.", throwable);
+                    }
+                } else {
+                    plugin.debug("Periodic sync (" + taskId + ") was cancelled while waiting for player futures.");
+                }
+            });
+         } else if (isBukkitTaskCancelled(taskId)) {
+              plugin.debug("Periodic sync (" + taskId + ") cycle aborted due to cancellation.");
          }
     }
 
 
     /**
-     * Checks if the Bukkit task is cancelled, handling potential IllegalStateException.
-     * This prevents errors if checking a task that the scheduler already considers finished.
-     * @return true if the task is cancelled or in an invalid state, false otherwise.
+     * Centralized cleanup logic for the bulk import task. Ensures it runs only once.
+     * Sets the running state to false, logs the final status, clears plugin references,
+     * and attempts to cancel the Bukkit task itself.
+     *
+     * @param finishedNaturally True if the task completed all items, false if cancelled/stopped early.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
      */
-    private boolean isBukkitTaskCancelled() {
+    private void cleanupBulkImport(boolean finishedNaturally, int taskId) {
+         // Use compareAndSet to ensure this cleanup logic runs only once per task instance
+         if (isRunning.compareAndSet(true, false)) {
+             plugin.log(Level.INFO, "--- StatsSyncTask (" + taskId + ") cleanupBulkImport running (finishedNaturally=" + finishedNaturally + ") ---");
+
+             // Log final status based on completion type
+             if (finishedNaturally) {
+                 Instant endTime = Instant.now();
+                 Duration duration = (importStartTime != null) ? Duration.between(importStartTime, endTime) : null;
+                 plugin.log(Level.INFO, "Bulk import (" + taskId + ") finished processing " + processedCount.get() + "/" + totalToProcess + " players" + (duration != null ? " in " + formatDuration(duration) : "."));
+             } else {
+                 plugin.log(Level.INFO, "Bulk import (" + taskId + ") stopped or cancelled after processing " + processedCount.get() + "/" + totalToProcess + " players.");
+             }
+
+             // Clear the references in the main plugin class to allow GC and prevent stale state
+             plugin.clearBulkImportTaskReferences();
+
+             // Attempt to explicitly cancel the Bukkit task to stop the timer
+             try {
+                 plugin.debug("--- StatsSyncTask (" + taskId + ") cleanupBulkImport attempting self-cancel...");
+                 this.cancel(); // Calls BukkitRunnable.cancel() -> which calls our override
+                 plugin.debug("--- StatsSyncTask (" + taskId + ") cleanupBulkImport self-cancel called.");
+             } catch (IllegalStateException e) {
+                 // This is expected if cancel() was already called externally or if the task finished very recently.
+                 plugin.debug("--- StatsSyncTask (" + taskId + ") cleanupBulkImport ignoring IllegalStateException during self-cancel, task likely already cancelled/finished by Bukkit.");
+             } catch (Exception e) {
+                 // Catch any other unexpected errors during cancellation
+                 plugin.log(Level.SEVERE, "--- StatsSyncTask (" + taskId + ") cleanupBulkImport Unexpected error during self-cancel!", e);
+             }
+             plugin.log(Level.INFO, "--- StatsSyncTask (" + taskId + ") cleanupBulkImport finished. ---");
+         } else {
+             // This might happen if cancel() is called rapidly multiple times or race conditions
+             plugin.debug("--- StatsSyncTask (" + taskId + ") cleanupBulkImport called but task was already marked as not running (isRunning=false). ---");
+         }
+    }
+
+    /**
+     * Override BukkitRunnable's cancel method to ensure our cleanup logic is triggered
+     * when cancelled externally (e.g., by command or plugin disable).
+     */
+    @Override
+    public synchronized void cancel() throws IllegalStateException {
+        int taskId = -1; try { taskId = getTaskId(); } catch (IllegalStateException ignored) {} // Safe get ID for logging
+        plugin.debug("StatsSyncTask (" + taskId + ") cancel() method invoked.");
+
+        // Variable 'wasCancelled' removed as it was unused.
+
         try {
-            // Check the BukkitRunnable's cancelled status
-            if (super.isCancelled()) {
-                 // Don't log excessively here, let the caller decide context
-                 // plugin.debug("Task cancellation detected by isBukkitTaskCancelled().");
-                 return true;
+            // Check if Bukkit already considers it cancelled BEFORE trying to cancel again
+            if (!super.isCancelled()) {
+                super.cancel(); // Attempt to cancel via Bukkit first
+                 plugin.debug("StatsSyncTask (" + taskId + ") cancel(): Called super.cancel().");
+            } else {
+                 plugin.debug("StatsSyncTask (" + taskId + ") cancel(): super.isCancelled() was already true.");
             }
-            return false;
         } catch (IllegalStateException e) {
-            // This exception means the task is no longer scheduled (finished or cancelled)
-            // according to the Bukkit scheduler. Treat it as cancelled for our logic.
-            plugin.debug("IllegalStateException caught in isBukkitTaskCancelled(), task likely already finished/cancelled by scheduler.");
-            return true;
+            plugin.debug("StatsSyncTask (" + taskId + ") cancel(): Caught IllegalStateException from super.isCancelled/cancel(), task likely already finished/cancelled by Bukkit.");
+            // No action needed here regarding the removed variable.
+        } finally {
+            // Crucially, ensure internal cleanup runs if this was a bulk import task,
+            // regardless of whether we called super.cancel() or it was already cancelled.
+            if (isBulkImport) {
+                plugin.debug("StatsSyncTask (" + taskId + ") cancel(): Triggering cleanupBulkImport(false).");
+                cleanupBulkImport(false, taskId); // Mark as cancelled externally
+            }
+        }
+    }
+
+    /**
+     * Checks if the Bukkit task associated with this runnable is cancelled.
+     * Handles potential IllegalStateException if the task is already finished.
+     * @param taskId The task ID for logging purposes (-1 if unavailable).
+     * @return true if the task is cancelled or finished, false otherwise.
+     */
+    private boolean isBukkitTaskCancelled(int taskId) {
+        try {
+            // Rely solely on BukkitRunnable's isCancelled() method.
+            boolean cancelled = super.isCancelled();
+            // if (cancelled) {
+            //     plugin.debug("isBukkitTaskCancelled (" + taskId + "): super.isCancelled() returned true.");
+            // }
+            return cancelled;
+        } catch (IllegalStateException e) {
+            // This catch block handles cases where the task state is inconsistent
+            // or checked too early/late according to Bukkit internals.
+            plugin.log(Level.WARNING,"isBukkitTaskCancelled (" + taskId + "): Caught IllegalStateException from super.isCancelled(). Task is likely finished or already cancelled.");
+            return true; // Treat as cancelled/finished if state is illegal
         }
     }
 
 
-    // --- Public method for commands/plugin to check logical status ---
-    // Note: This reflects the internal 'isRunning' flag, not Bukkit's scheduler status directly.
+    /**
+     * Checks if the bulk import task *believes* it should be running.
+     * @return True if the bulk import is active, false otherwise or if not in bulk mode.
+     */
     public boolean isTaskRunning() {
-        // Check both the atomic boolean AND the iterator status for bulk import
-        // to handle cases where the task might be scheduled but hasn't started processing yet.
-        if (isBulkImport) {
-            return isRunning.get() && bulkImportIterator != null && bulkImportIterator.hasNext();
-        } else {
-            // For periodic sync, we rely solely on Bukkit's scheduler status,
-            // so this method isn't the primary way to check.
-            // However, returning false seems reasonable if not bulk import.
-            return false;
-        }
+        // This reflects the internal state flag, primarily for the bulk import.
+        // It might briefly be true even if cancellation is in progress but cleanup hasn't finished.
+        return isBulkImport && isRunning.get();
     }
 
-
-    // --- Utility to format Duration ---
+    /**
+     * Formats a Duration into a human-readable string (Hh MMm SSs).
+     * @param duration The duration to format.
+     * @return Formatted string or "N/A".
+     */
     private String formatDuration(Duration duration) {
         if (duration == null) return "N/A";
-        long seconds = duration.getSeconds();
+        long seconds = duration.toSeconds(); // Use toSeconds for simplicity
         long absSeconds = Math.abs(seconds);
         String positive = String.format(
                 "%dh %02dm %02ds",
                 absSeconds / 3600,
                 (absSeconds % 3600) / 60,
                 absSeconds % 60);
-        // Handle potential negative duration if clock adjustments occur, though unlikely here
         return seconds < 0 ? "-" + positive : positive;
     }
 }

@@ -116,20 +116,25 @@ public class StatsExporterCommand implements CommandExecutor {
 
         long playersPerTick = plugin.getPluginConfig().getLong("import.playersPerTick", 2);
         long delayTicks = plugin.getPluginConfig().getLong("import.delayBetweenPlayersTicks", 0);
-        long period = Math.max(1L, delayTicks);
+        // Ensure period is at least 1 tick for runTaskTimerAsynchronously
+        // If configured delay is 0, use a period of 1 tick. Otherwise use the configured delay (but min 1).
+        long period = Math.max(1L, delayTicks > 0 ? delayTicks : 1L);
 
         try {
+            // Create the BukkitRunnable instance
             StatsSyncTask bulkImportRunnable = new StatsSyncTask(plugin, uuidsToImport);
 
-            // Use explicit Runnable to silence deprecation warning
-            Runnable taskAsRunnable = bulkImportRunnable;
-            BukkitTask task = Bukkit.getScheduler().runTaskTimerAsynchronously(
-                    plugin,
-                    taskAsRunnable, // Pass the Runnable
-                    20L,            // Start after 1 second delay
-                    period
+            // *** CORRECTED SCHEDULING ***
+            // Schedule the task using its *own* method, not the general scheduler method.
+            // This correctly initializes the BukkitRunnable's internal state.
+            BukkitTask task = bulkImportRunnable.runTaskTimerAsynchronously(
+                    plugin,       // The plugin instance
+                    20L,          // Initial delay in ticks (1 second)
+                    period        // Repeat period in ticks
             );
+            // ***************************
 
+            // Store references to the runnable and the task for management (cancel, status)
             plugin.setBulkImportTask(bulkImportRunnable, task);
 
             sender.sendMessage(prefix.append(Component.text("Bulk import task scheduled. Processing approx. " +
@@ -138,8 +143,15 @@ public class StatsExporterCommand implements CommandExecutor {
                 .append(Component.text("/" + "statsexporter" + " cancelimport", NamedTextColor.GOLD))
                 .append(Component.text(" to stop.")));
 
+        } catch (IllegalStateException e) {
+             // This might catch "Already scheduled" if something went wrong with the isBulkImportRunning check,
+             // or potentially other scheduler issues.
+             plugin.log(Level.SEVERE, "Failed to schedule bulk import task! (IllegalStateException). Check if it was already running.", e);
+             sender.sendMessage(prefix.append(Component.text("Error scheduling bulk import task (IllegalStateException). Check console.", NamedTextColor.RED)));
+             plugin.clearBulkImportTaskReferences(); // Attempt cleanup
         } catch (Exception e) {
-            plugin.log(Level.SEVERE, "Failed to schedule bulk import task!", e);
+            // Catch any other unexpected exceptions during scheduling
+            plugin.log(Level.SEVERE, "An unexpected error occurred while scheduling the bulk import task!", e);
             sender.sendMessage(prefix.append(Component.text("Error scheduling bulk import task. Check console.", NamedTextColor.RED)));
             plugin.clearBulkImportTaskReferences();
         }
@@ -152,28 +164,34 @@ public class StatsExporterCommand implements CommandExecutor {
         }
 
         sender.sendMessage(prefix.append(Component.text("Attempting to cancel the bulk import task...")));
-        plugin.cancelBulkImportTask();
+        plugin.cancelBulkImportTask(); // This now calls the cancel() override in StatsSyncTask
 
+        // Give the asynchronous cancellation a moment to process and update state
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
             if (!plugin.isBulkImportRunning()) {
                 sender.sendMessage(prefix.append(Component.text("Bulk import task cancelled successfully.", NamedTextColor.GREEN)));
                 plugin.log(Level.INFO, "Bulk import task cancelled by " + sender.getName());
             } else {
-                sender.sendMessage(prefix.append(Component.text("Failed to cancel the bulk import task. It might have already finished or an error occurred.", NamedTextColor.RED)));
+                // If it's still considered running, cancellation might have failed or is still processing.
+                sender.sendMessage(prefix.append(Component.text("Failed to confirm bulk import task cancellation immediately. It might finish shortly or an error occurred.", NamedTextColor.RED)));
+                plugin.log(Level.WARNING, "Bulk import cancellation requested by " + sender.getName() + ", but isBulkImportRunning() is still true after a short delay.");
             }
-        }, 2L);
+        }, 5L); // Using a slightly longer delay (5 ticks = 0.25s) just in case
     }
 
     private void handleReload(CommandSender sender) {
         sender.sendMessage(prefix.append(Component.text("Reloading configuration...")));
         plugin.reloadConfig();
-        sender.sendMessage(prefix.append(Component.text("Configuration reloaded. Critical changes like API URL/Key may require a plugin restart (/plugman reload StatsExporter or server restart).", NamedTextColor.GREEN)));
+        // Update internal plugin state if needed based on new config values.
+        // Note: Critical changes like API URL/Key might still require a full plugin restart/reload
+        // for components like OkHttpClient to reliably pick them up.
+        sender.sendMessage(prefix.append(Component.text("Configuration reloaded.", NamedTextColor.GREEN)));
+        sender.sendMessage(prefix.append(Component.text("Note: API URL/Key changes usually require a plugin restart (/plugman reload StatsExporter or server restart).", NamedTextColor.YELLOW)));
         plugin.log(Level.INFO, "Configuration reloaded via command by " + sender.getName());
     }
 
     private void handleStatus(CommandSender sender) {
-         // Correctly apply decoration using .decorate() and TextDecoration.UNDERLINED
-         sender.sendMessage(prefix.append(Component.text("StatsExporter Status:").decorate(TextDecoration.UNDERLINED))); // <-- FIX APPLIED HERE
+         sender.sendMessage(prefix.append(Component.text("StatsExporter Status:").decorate(TextDecoration.UNDERLINED)));
 
          sender.sendMessage(Component.text(" Version: ", NamedTextColor.YELLOW)
              .append(Component.text(plugin.getPluginMeta().getVersion(), NamedTextColor.WHITE)));
@@ -185,9 +203,10 @@ public class StatsExporterCommand implements CommandExecutor {
              .append(Component.text(plugin.getPluginConfig().getBoolean("sync.onQuit", true), NamedTextColor.WHITE)));
 
          boolean periodicEnabled = plugin.getPluginConfig().getBoolean("sync.periodicOnlineSync", true);
+         long periodicInterval = plugin.getPluginConfig().getLong("sync.periodicOnlineSyncIntervalMinutes", 20);
          sender.sendMessage(Component.text(" Periodic Sync: ", NamedTextColor.YELLOW)
              .append(Component.text(periodicEnabled, NamedTextColor.WHITE))
-             .append(periodicEnabled ? Component.text(" (" + plugin.getPluginConfig().getLong("sync.periodicOnlineSyncIntervalMinutes", 20) + " min interval)", NamedTextColor.WHITE) : Component.empty()));
+             .append(periodicEnabled ? Component.text(" (" + periodicInterval + " min interval)", NamedTextColor.GRAY) : Component.empty()));
 
          boolean importRunning = plugin.isBulkImportRunning();
          sender.sendMessage(Component.text(" Bulk Import Active: ", NamedTextColor.YELLOW)
@@ -196,6 +215,10 @@ public class StatsExporterCommand implements CommandExecutor {
          if (plugin.getHttpUtils() != null) {
             sender.sendMessage(Component.text(" Current Upload Queue Size: ", NamedTextColor.YELLOW)
                 .append(Component.text(plugin.getHttpUtils().getQueueSize(), NamedTextColor.WHITE)));
+         } else {
+             // HttpUtils might be null if plugin failed during startup before it was initialized
+             sender.sendMessage(Component.text(" Current Upload Queue Size: ", NamedTextColor.YELLOW)
+                .append(Component.text("N/A (HttpUtils not initialized)", NamedTextColor.GRAY)));
          }
 
          sender.sendMessage(Component.text("--------------------", NamedTextColor.GRAY));
