@@ -1,0 +1,39 @@
+# Required - Plugin name
+name: StatsExporter
+# Required - Plugin version (replaced by Maven)
+version: ${project.version}
+# Required - Main plugin class path
+main: com.rafalohaki.statsexporter.StatsExporterPlugin
+# Required - Target Server API version
+api-version: '1.21'
+
+# Optional - Description (replaced by Maven)
+description: ${project.description} # Description updated in pom.xml
+# Optional - Author name
+author: rafalohaki
+
+# Optional - Website
+# website: https://yourwebsite.com
+
+# NO required dependencies anymore
+# depend: [] # Can be omitted entirely
+
+# NO soft dependencies anymore
+# softdepend: [] # Can be omitted entirely
+
+# Optional - Load timing
+load: STARTUP
+
+# Define the command for manual import/control
+commands:
+  statsexporter:
+    description: Manages the StatsExporter plugin.
+    usage: /<command> [importvanilla|status|reload]
+    aliases: [se, sxp] # Optional short aliases
+    permission: statsexporter.admin
+
+# Define permissions
+permissions:
+  statsexporter.admin:
+    description: Allows usage of the /statsexporter command.
+    default: op # Or false, if you prefer explicit granting

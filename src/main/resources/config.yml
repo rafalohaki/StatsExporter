@@ -1,0 +1,44 @@
+# Configuration for StatsExporter Plugin
+
+# Settings for connecting to your external API endpoint
+api:
+  # The URL where the statistics data (POST request) should be sent
+  # Example: "https://your-worker.yourdomain.workers.dev/stats"
+  url: ""
+  # A secret key to authenticate the plugin with your API endpoint.
+  # Send this in an HTTP header (e.g., 'Authorization: Bearer <key>')
+  key: "YOUR_SECRET_API_KEY_HERE"
+  # Timeout in seconds for HTTP requests
+  timeoutSeconds: 10
+
+# Settings for batching data before sending to the API
+batch:
+  # Maximum number of player data updates to group into a single API request
+  maxSize: 50
+  # Maximum delay in seconds. A batch will be sent after this time
+  # even if maxSize isn't reached (for players logging off, etc.)
+  maxDelaySeconds: 15
+
+# Settings for the initial bulk import using /statsexporter importvanilla
+import:
+  # How many player stat files to process per server tick during bulk import.
+  # Lower values reduce impact but increase import time. Recommended: 1-5
+  playersPerTick: 2
+  # How many ticks to wait between processing each player file in bulk mode.
+  # Adds extra throttling. 0 = no extra delay, 1 = tiny delay.
+  delayBetweenPlayersTicks: 0
+
+# Settings for automatic synchronization based on events and timers
+sync:
+  # Send player stats when they log off? (Recommended: true)
+  onQuit: true
+  # Run a task periodically to sync stats for all currently ONLINE players?
+  # Useful for players who stay online for a long time between data saves.
+  periodicOnlineSync: true
+  # Interval in minutes for the periodic online player sync task.
+  # Only used if periodicOnlineSync is true. Set to 0 or less to disable.
+  periodicOnlineSyncIntervalMinutes: 20
+
+# Enable debug messages in the server console? (true/false)
+# Useful for troubleshooting, but can be spammy.
+debug: false
